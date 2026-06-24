@@ -98,17 +98,20 @@
 #[cfg(test)]
 mod tests;
 
-use crossbeam_channel::{Receiver, Sender};
 use futures_channel::oneshot;
 use std::{
     fmt::{self, Debug, Display},
     path::Path,
-    thread,
 };
 
 pub use rusqlite::{self, *};
 
-const BUG_TEXT: &str = "bug in tokio-rusqlite, please report";
+// The backend serializes access to the wrapped `rusqlite::Connection`.
+#[cfg_attr(target_os = "unknown", path = "backend/inline.rs")]
+#[cfg_attr(not(target_os = "unknown"), path = "backend/threaded.rs")]
+mod backend;
+
+pub(crate) const BUG_TEXT: &str = "bug in tokio-rusqlite, please report";
 
 #[derive(Debug)]
 /// Represents the errors specific for this library.
@@ -155,17 +158,28 @@ impl From<rusqlite::Error> for Error {
 /// The result returned on method calls in this crate.
 pub type Result<T> = std::result::Result<T, Error>;
 
-type CallFn = Box<dyn FnOnce(&mut rusqlite::Connection) + Send + 'static>;
+/// A boxed function to be run against the [`rusqlite::Connection`].
+///
+/// Each backend (see the private `backend` module) runs these against its
+/// connection in submission order.
+pub(crate) type CallFn = Box<dyn FnOnce(&mut rusqlite::Connection) + Send + 'static>;
 
-enum Message {
-    Execute(CallFn),
-    Close(oneshot::Sender<std::result::Result<(), rusqlite::Error>>),
-}
+/// Marker error signalling that a connection is no longer available.
+///
+/// Returned by an backend's `submit` when the underlying connection has already
+/// been closed.
+#[derive(Debug)]
+pub(crate) struct Closed;
 
-/// A handle to call functions in background thread.
+/// A handle to call functions in a backend.
+///
+/// On targets with an OS, functions are called in a separate thread and communication
+/// is via channels.
+///
+/// On targets without an OS, functions are called inline, blocking the current thread.
 #[derive(Clone)]
 pub struct Connection {
-    sender: Sender<Message>,
+    handle: backend::Handle,
 }
 
 impl Connection {
@@ -181,7 +195,9 @@ impl Connection {
     /// string or if the underlying SQLite open call fails.
     pub async fn open<P: AsRef<Path>>(path: P) -> std::result::Result<Self, rusqlite::Error> {
         let path = path.as_ref().to_owned();
-        start(move || rusqlite::Connection::open(path)).await
+        backend::start(move || rusqlite::Connection::open(path))
+            .await
+            .map(|handle| Self { handle })
     }
 
     /// Open a new connection to an in-memory SQLite database.
@@ -190,7 +206,9 @@ impl Connection {
     ///
     /// Will return `Err` if the underlying SQLite open call fails.
     pub async fn open_in_memory() -> std::result::Result<Self, rusqlite::Error> {
-        start(rusqlite::Connection::open_in_memory).await
+        backend::start(rusqlite::Connection::open_in_memory)
+            .await
+            .map(|handle| Self { handle })
     }
 
     /// Open a new connection to a SQLite database.
@@ -207,7 +225,9 @@ impl Connection {
         flags: OpenFlags,
     ) -> std::result::Result<Self, rusqlite::Error> {
         let path = path.as_ref().to_owned();
-        start(move || rusqlite::Connection::open_with_flags(path, flags)).await
+        backend::start(move || rusqlite::Connection::open_with_flags(path, flags))
+            .await
+            .map(|handle| Self { handle })
     }
 
     /// Open a new connection to a SQLite database using the specific flags
@@ -227,7 +247,9 @@ impl Connection {
     ) -> std::result::Result<Self, rusqlite::Error> {
         let path = path.as_ref().to_owned();
         let vfs = vfs.to_owned();
-        start(move || rusqlite::Connection::open_with_flags_and_vfs(path, flags, &*vfs)).await
+        backend::start(move || rusqlite::Connection::open_with_flags_and_vfs(path, flags, &*vfs))
+            .await
+            .map(|handle| Self { handle })
     }
 
     /// Open a new connection to an in-memory SQLite database.
@@ -241,7 +263,9 @@ impl Connection {
     pub async fn open_in_memory_with_flags(
         flags: OpenFlags,
     ) -> std::result::Result<Self, rusqlite::Error> {
-        start(move || rusqlite::Connection::open_in_memory_with_flags(flags)).await
+        backend::start(move || rusqlite::Connection::open_in_memory_with_flags(flags))
+            .await
+            .map(|handle| Self { handle })
     }
 
     /// Open a new connection to an in-memory SQLite database using the
@@ -259,7 +283,11 @@ impl Connection {
         vfs: &str,
     ) -> std::result::Result<Self, rusqlite::Error> {
         let vfs = vfs.to_owned();
-        start(move || rusqlite::Connection::open_in_memory_with_flags_and_vfs(flags, &*vfs)).await
+        backend::start(move || {
+            rusqlite::Connection::open_in_memory_with_flags_and_vfs(flags, &*vfs)
+        })
+        .await
+        .map(|handle| Self { handle })
     }
 
     /// Call a function in background thread and get the result
@@ -294,11 +322,11 @@ impl Connection {
     {
         let (sender, receiver) = oneshot::channel::<R>();
 
-        self.sender
-            .send(Message::Execute(Box::new(move |conn| {
+        self.handle
+            .submit(Box::new(move |conn| {
                 let value = function(conn);
                 let _ = sender.send(value);
-            })))
+            }))
             .map_err(|_| Error::ConnectionClosed)?;
 
         receiver.await.map_err(|_| Error::ConnectionClosed)
@@ -319,11 +347,11 @@ impl Connection {
     {
         let (sender, receiver) = oneshot::channel::<R>();
 
-        self.sender
-            .send(Message::Execute(Box::new(move |conn| {
+        self.handle
+            .submit(Box::new(move |conn| {
                 let value = function(conn);
                 let _ = sender.send(value);
-            })))
+            }))
             .expect("database connection should be open");
 
         receiver.await.expect(BUG_TEXT)
@@ -345,23 +373,10 @@ impl Connection {
     ///
     /// Will return `Err` if the underlying SQLite close call fails.
     pub async fn close(self) -> Result<()> {
-        let (sender, receiver) = oneshot::channel::<std::result::Result<(), rusqlite::Error>>();
-
-        if let Err(crossbeam_channel::SendError(_)) = self.sender.send(Message::Close(sender)) {
-            // If the channel is closed on the other side, it means the connection closed successfully
-            // This is a safeguard against calling close on a `Copy` of the connection
-            return Ok(());
+        match self.handle.close().await {
+            Ok(()) => Ok(()),
+            Err(e) => Err(Error::Close((self, e))),
         }
-
-        let result = receiver.await;
-
-        if result.is_err() {
-            // If we get a RecvError at this point, it also means the channel closed in the meantime
-            // we can assume the connection is closed
-            return Ok(());
-        }
-
-        result.unwrap().map_err(|e| Error::Close((self, e)))
     }
 }
 
@@ -373,60 +388,8 @@ impl Debug for Connection {
 
 impl From<rusqlite::Connection> for Connection {
     fn from(conn: rusqlite::Connection) -> Self {
-        let (sender, receiver) = crossbeam_channel::unbounded::<Message>();
-        thread::spawn(move || event_loop(conn, receiver));
-
-        Self { sender }
-    }
-}
-
-async fn start<F>(open: F) -> rusqlite::Result<Connection>
-where
-    F: FnOnce() -> rusqlite::Result<rusqlite::Connection> + Send + 'static,
-{
-    let (sender, receiver) = crossbeam_channel::unbounded::<Message>();
-    let (result_sender, result_receiver) = oneshot::channel();
-
-    thread::spawn(move || {
-        let conn = match open() {
-            Ok(c) => c,
-            Err(e) => {
-                let _ = result_sender.send(Err(e));
-                return;
-            }
-        };
-
-        if let Err(_e) = result_sender.send(Ok(())) {
-            return;
-        }
-
-        event_loop(conn, receiver);
-    });
-
-    result_receiver
-        .await
-        .expect(BUG_TEXT)
-        .map(|_| Connection { sender })
-}
-
-fn event_loop(mut conn: rusqlite::Connection, receiver: Receiver<Message>) {
-    while let Ok(message) = receiver.recv() {
-        match message {
-            Message::Execute(f) => f(&mut conn),
-            Message::Close(s) => {
-                let result = conn.close();
-
-                match result {
-                    Ok(v) => {
-                        s.send(Ok(v)).expect(BUG_TEXT);
-                        break;
-                    }
-                    Err((c, e)) => {
-                        conn = c;
-                        s.send(Err(e)).expect(BUG_TEXT);
-                    }
-                }
-            }
+        Self {
+            handle: backend::Handle::from_connection(conn),
         }
     }
 }

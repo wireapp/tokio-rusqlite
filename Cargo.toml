@@ -66,9 +66,12 @@ window = ["rusqlite/window"]
 with-asan = ["rusqlite/with-asan"]
 
 [dependencies]
-crossbeam-channel = "0.5"
 futures-channel = "0.3.32"
 rusqlite = "0.38.0"
+
+# Only the threaded backend uses these dependencies. 
+[target.'cfg(not(target_os = "unknown"))'.dependencies]
+crossbeam-channel = "0.5"
 
 [dev-dependencies]
 rusqlite = { version = "0.38", features = ["bundled"] }
