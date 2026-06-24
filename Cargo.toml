@@ -73,6 +73,11 @@ rusqlite = "0.38.0"
 [target.'cfg(not(target_os = "unknown"))'.dependencies]
 crossbeam-channel = "0.5"
 
-[dev-dependencies]
+# The threaded backend's tests run under tokio and link a bundled SQLite.
+[target.'cfg(not(target_os = "unknown"))'.dev-dependencies]
 rusqlite = { version = "0.38", features = ["bundled"] }
 tokio = { version = "1", features = ["full"] }
+
+# The inline backend's tests run under wasm-bindgen-test. 
+[target.'cfg(target_os = "unknown")'.dev-dependencies]
+wasm-bindgen-test = "0.3"
