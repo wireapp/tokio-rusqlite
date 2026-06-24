@@ -49,6 +49,56 @@ jobs:
           command: test
           args: --no-default-features --features modern-full
 
+  test_wasm_no_features:
+    name: Test wasm32-unknown-unknown no features
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+      - uses: actions-rs/toolchain@v1
+        with:
+          profile: minimal
+          toolchain: stable
+          target: wasm32-unknown-unknown
+          override: true
+      - uses: Swatinem/rust-cache@v2
+      # The wasm-bindgen-test runner must match the resolved wasm-bindgen crate
+      # exactly, so derive its version from the dependency graph.
+      - name: Determine wasm-bindgen version
+        run: |
+          echo "WASM_BINDGEN_VERSION=$(cargo metadata --format-version 1 | jq -r '.packages[] | select(.name == "wasm-bindgen") | .version')" >> "$GITHUB_ENV"
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: wasm-bindgen-cli@${{ env.WASM_BINDGEN_VERSION }}
+      - uses: actions-rs/cargo@v1
+        with:
+          command: test
+          args: --lib --target wasm32-unknown-unknown
+
+  test_wasm_all_features:
+    name: Test wasm32-unknown-unknown modern-full
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+      - uses: actions-rs/toolchain@v1
+        with:
+          profile: minimal
+          toolchain: stable
+          target: wasm32-unknown-unknown
+          override: true
+      - uses: Swatinem/rust-cache@v2
+      # The wasm-bindgen-test runner must match the resolved wasm-bindgen crate
+      # exactly, so derive its version from the dependency graph.
+      - name: Determine wasm-bindgen version
+        run: |
+          echo "WASM_BINDGEN_VERSION=$(cargo metadata --format-version 1 | jq -r '.packages[] | select(.name == "wasm-bindgen") | .version')" >> "$GITHUB_ENV"
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: wasm-bindgen-cli@${{ env.WASM_BINDGEN_VERSION }}
+      - uses: actions-rs/cargo@v1
+        with:
+          command: test
+          args: --lib --target wasm32-unknown-unknown --no-default-features --features modern-full
+
   fmt:
     name: Rustfmt
     runs-on: ubuntu-latest
