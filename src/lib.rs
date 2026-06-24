@@ -99,12 +99,12 @@
 mod tests;
 
 use crossbeam_channel::{Receiver, Sender};
+use futures_channel::oneshot;
 use std::{
     fmt::{self, Debug, Display},
     path::Path,
     thread,
 };
-use tokio::sync::oneshot::{self};
 
 pub use rusqlite::{self, *};
 
